@@ -422,6 +422,10 @@ def datetimeformat_filter(value):
 def tutorials():
     return render_template('tutorials.html')
 
+@app.route('/stories')
+def stories():
+    return render_template("stories.html")
+
 if __name__ == '__main__':
     logger.info("=" * 60)
     logger.info("Agri-Vision Cotton Analysis System")
