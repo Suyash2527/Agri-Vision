@@ -87,7 +87,7 @@
 
     /* Theme override fixes */
     --warm-earth: #BCAAA4; /* High contrast warm-sand instead of dark-brown */
-    --footer-bg: #091A11;  /* High contrast deep-green-black */
+      /* High contrast deep-green-black */
     --footer-text: #E0EAE2;
     --footer-muted: rgba(224, 234, 226, 0.6);
 }
@@ -1185,9 +1185,8 @@ body {
 }
 
 [data-theme="dark"] .footer {
-    background: #00180d;
+    background: #131313;
     border-top: 1px solid rgba(255, 255, 255, 0.08);
-    background: var(--footer-bg);
     color: var(--footer-text);
     padding: 2.5rem 2rem 1.5rem; /* Significantly reduced padding */
     transition: var(--transition-smooth);
