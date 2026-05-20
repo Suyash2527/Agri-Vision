@@ -18,7 +18,7 @@ It helps farmers and researchers make informed decisions about crop management a
 
 <br>
 
-<table>
+<table align="center">
 <tr>
 <td width="50%">
 
@@ -51,7 +51,8 @@ It helps farmers and researchers make informed decisions about crop management a
 ### 💡 Smart Agriculture • AI Driven • Modern Workflow
 
 </div>
-## 📌 Overview
+
+##  📌 Overview
 
 Agri-Vision uses deep learning and computer vision techniques to:
 
