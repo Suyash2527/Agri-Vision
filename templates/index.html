@@ -20,6 +20,93 @@
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
     <!-- Three.js CDN for interactive 3D model simulation -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <style>
+        .chatbot-widget {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            width: 320px;
+            background: var(--bg-card, #ffffff);
+            border-radius: 12px;
+            box-shadow: 0 5px 20px rgba(0,0,0,0.15);
+            z-index: 1000;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            border: 1px solid var(--border-color, #e0e0e0);
+            transition: all 0.3s ease;
+        }
+        .chatbot-header {
+            background: var(--primary-green, #2e8b57);
+            color: #ffffff;
+            padding: 12px 15px;
+            font-weight: 600;
+            cursor: pointer;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .chatbot-body {
+            height: 380px;
+            display: flex;
+            flex-direction: column;
+        }
+        .chat-messages {
+            flex-grow: 1;
+            padding: 15px;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            background: var(--bg-body, #f9f9f9);
+        }
+        .chat-message {
+            max-width: 85%;
+            padding: 10px 14px;
+            border-radius: 15px;
+            font-size: 0.9rem;
+            line-height: 1.4;
+        }
+        .ai-message {
+            background: var(--bg-chat-ai, #e8f5e9);
+            color: var(--text-color, #333333);
+            align-self: flex-start;
+            border-bottom-left-radius: 4px;
+        }
+        .user-message {
+            background: var(--primary-green, #2e8b57);
+            color: #ffffff;
+            align-self: flex-end;
+            border-bottom-right-radius: 4px;
+        }
+        .chat-input-container {
+            display: flex;
+            padding: 10px;
+            border-top: 1px solid var(--border-color, #e0e0e0);
+            background: var(--bg-card, #ffffff);
+        }
+        .chat-input-container input {
+            flex-grow: 1;
+            border: 1px solid var(--border-color, #e0e0e0);
+            border-radius: 20px;
+            padding: 8px 15px;
+            outline: none;
+            background: transparent;
+            color: var(--text-color, #333333);
+        }
+        .chat-send-btn {
+            background: none;
+            border: none;
+            color: var(--primary-green, #2e8b57);
+            cursor: pointer;
+            padding: 0 10px;
+            font-size: 1.2rem;
+            transition: transform 0.2s;
+        }
+        .chat-send-btn:hover {
+            transform: scale(1.1);
+        }
+    </style>
 </head>
 <body>
     <!-- Professional Print Frame (Only visible in print) -->
@@ -36,6 +123,7 @@
                 <li><a href="/">Home</a></li>
                 <li><a href="/analyze">Analyze</a></li>
                 <li><a href="/comparison">Field Comparison</a></li>
+
                 <li><a href="/demo">Demo</a></li>
                 <li><a href="/tutorials">Tutorials</a></li>
                 <li><a href="/stories">Stories</a></li>
@@ -234,6 +322,7 @@
                 <a href="/">Home</a>
                 <a href="/analyze">Analyze</a>
                 <a href="/comparison">Field Comparison</a>
+                <a href="/dashboard">Dashboard</a>
                 <a href="/demo">Demo</a>
                 <a href="/tutorials">Tutorials</a>
                 <a href="/support">Support</a>
