@@ -595,59 +595,78 @@ def read_uploaded_image(file_storage) -> Tuple[str, np.ndarray, np.ndarray]:
 def analyze_image(image: np.ndarray) -> Dict[str, Any]:
     ensure_models_loaded()
 
-    growth = infer_growth_stage(image)
-    disease = infer_disease(image)
-
-    grad_cam_image_b64 = None
-    if resnet_model is not None and disease.get("predicted_class_idx") is not None:
+    try:
         try:
-            input_tensor = preprocess_image_for_resnet(image)
-            with GradCAM(resnet_model, resnet_model.layer4[-1]) as grad_cam:
-                grad_cam_overlay = grad_cam(input_tensor, disease["predicted_class_idx"], image)
-            if grad_cam_overlay is not None:
-                grad_cam_image_b64 = encode_image_for_display(grad_cam_overlay)
+            growth = infer_growth_stage(image)
         except Exception as exc:
-            logger.error("Error generating Grad-CAM: %s", exc)
+            logger.error("Error during growth stage inference: %s", exc)
+            growth = {
+                "main_class": None,
+                "main_class_idx": None,
+                "confidence": 0.0,
+                "boxes": [],
+                "raw": [],
+            }
 
-    if grad_cam_image_b64 is None:
-        try:
-            mock_overlay = apply_heatmap_on_image(image, generate_mock_heatmap(image))
-            grad_cam_image_b64 = encode_image_for_display(mock_overlay)
-        except Exception as exc:
-            logger.error("Error generating fallback heatmap: %s", exc)
+        disease = infer_disease(image)
+        if not isinstance(disease, dict) or "predicted_class" not in disease or "health_score" not in disease:
+            raise ValueError("Invalid disease model prediction output.")
 
-    disease["heatmap_b64"] = grad_cam_image_b64
+        grad_cam_image_b64 = None
+        if resnet_model is not None and disease.get("predicted_class_idx") is not None:
+            try:
+                input_tensor = preprocess_image_for_resnet(image)
+                with GradCAM(resnet_model, resnet_model.layer4[-1]) as grad_cam:
+                    grad_cam_overlay = grad_cam(input_tensor, disease["predicted_class_idx"], image)
+                if grad_cam_overlay is not None:
+                    grad_cam_image_b64 = encode_image_for_display(grad_cam_overlay)
+            except Exception as exc:
+                logger.error("Error generating Grad-CAM: %s", exc)
 
-    recs = generate_recommendations(disease, growth)
-    severity = calculate_disease_severity(disease["health_score"])
-    y_pred = predict_yield(disease["health_score"], growth.get("main_class", "Unknown"))
-    adv_recs = generate_advanced_recommendations(disease, growth)
-    insights = generate_farmer_insights(disease, growth)
+        if grad_cam_image_b64 is None:
+            try:
+                mock_overlay = apply_heatmap_on_image(image, generate_mock_heatmap(image))
+                grad_cam_image_b64 = encode_image_for_display(mock_overlay)
+            except Exception as exc:
+                logger.error("Error generating fallback heatmap: %s", exc)
 
-    result = {
-        "disease": disease,
-        "growth": growth,
-        "recommendations": recs,
-        "grad_cam_image_b64": grad_cam_image_b64,
-        "disease_severity": severity,
-        "yield_prediction": y_pred,
-        "advanced_recommendations": adv_recs,
-        "farmer_insights": insights,
-    }
+        disease["heatmap_b64"] = grad_cam_image_b64
 
-    if growth["main_class"] is None:
-        fallback_reason = (
-            "Growth stage model unavailable in this deployment."
-            if yolo_model is None
-            else "Cotton growth stage could not be detected from the uploaded image."
-        )
-        result["warnings"] = [
-            fallback_reason,
-            "Disease analysis is still provided, but comparison may be less reliable without a confirmed cotton crop detection.",
-            "Grad-CAM explainability may also be affected if the primary crop is not detected.",
-        ]
+        recs = generate_recommendations(disease, growth)
+        severity = calculate_disease_severity(disease["health_score"])
+        y_pred = predict_yield(disease["health_score"], growth.get("main_class", "Unknown"))
+        adv_recs = generate_advanced_recommendations(disease, growth)
+        insights = generate_farmer_insights(disease, growth)
 
-    return result
+        result = {
+            "disease": disease,
+            "growth": growth,
+            "recommendations": recs,
+            "grad_cam_image_b64": grad_cam_image_b64,
+            "disease_severity": severity,
+            "yield_prediction": y_pred,
+            "advanced_recommendations": adv_recs,
+            "farmer_insights": insights,
+        }
+
+        if growth.get("main_class") is None:
+            fallback_reason = (
+                "Growth stage model unavailable in this deployment."
+                if yolo_model is None
+                else "Cotton growth stage could not be detected from the uploaded image."
+            )
+            result["warnings"] = [
+                fallback_reason,
+                "Disease analysis is still provided, but comparison may be less reliable without a confirmed cotton crop detection.",
+                "Grad-CAM explainability may also be affected if the primary crop is not detected.",
+            ]
+
+        return result
+    except Exception as exc:
+        logger.error("Unexpected error in image analysis: %s", exc)
+        return {
+            "error": "The AI model encountered an unexpected error while analyzing the image. Please verify the image file format and content and try again."
+        }
 
 
 def build_comparison_result(old_results: Dict[str, Any], new_results: Dict[str, Any]) -> Dict[str, Any]:
