@@ -1,9 +1,6 @@
 {% extends "index.html" %}
 {% block content %}
 
-{% extends "index.html" %}
-{% block content %}
-
 {% set disease = results.disease|default({}) %}
 {% set growth = results.growth|default({}) %}
 {% set disease_confidences = disease.all_confidences|default({}) %}
@@ -698,6 +695,21 @@
         </ul>
       </div>
 
+<div class="agri-scan-history-panel">
+  <div class="agri-scan-history-head">
+    <h2 class="results-section-title">
+      <i class="fas fa-clock-rotate-left"></i> Recent Analyses
+    </h2>
+  </div>
+
+  <div id="agri-scan-history-empty" class="agri-scan-history-empty">
+    No previous crop analyses found.
+  </div>
+
+  <div id="agri-scan-history-list" class="agri-scan-history-list"></div>
+</div>
+
+<!-- Farmer-Friendly Insights -->
       {% if results.farmer_insights %}
       <div class="result-card">
         <h2 class="results-section-title">
@@ -857,6 +869,70 @@
         showingGradCam = !showingGradCam;
       });
     }
+
+    var historyKey = "agriVisionScanHistory";
+    var historyList = document.getElementById("agri-scan-history-list");
+    var historyEmpty = document.getElementById("agri-scan-history-empty");
+
+    function getScanHistory() {
+      try {
+        return JSON.parse(localStorage.getItem(historyKey)) || [];
+      } catch (e) {
+        return [];
+      }
+    }
+
+    function saveScanHistory(items) {
+      localStorage.setItem(historyKey, JSON.stringify(items.slice(0, 8)));
+    }
+
+    function renderScanHistory() {
+      if (!historyList || !historyEmpty) return;
+      var items = getScanHistory();
+      historyList.innerHTML = "";
+      historyEmpty.style.display = items.length ? "none" : "block";
+
+      items.forEach(function (item, index) {
+        var card = document.createElement("div");
+        card.className = "agri-scan-history-card";
+        card.innerHTML =
+          '<img class="agri-scan-history-img" src="' + item.image + '" alt="Previous crop analysis">' +
+          '<div class="agri-scan-history-body">' +
+          '<div class="agri-scan-history-disease">' + item.disease + '</div>' +
+          '<div class="agri-scan-history-confidence">' + item.confidence + '% Confidence</div>' +
+          '<div class="agri-scan-history-date">' + item.timestamp + '</div>' +
+          '<button type="button" class="agri-scan-history-delete" data-index="' + index + '">Remove</button>' +
+          '</div>';
+        historyList.appendChild(card);
+      });
+    }
+
+    {% if image_b64 %}
+    var currentScan = {
+      image: "data:image/jpeg;base64,{{ image_b64 }}",
+      disease: {{ disease.detected_issue|default(disease.predicted_class|default("Unknown"))|tojson }},
+      confidence: "{{ disease.model_confidence|default(0)|float|round(2) }}",
+      timestamp: {{ timestamp|default("")|tojson }}
+    };
+    var scanHistory = getScanHistory();
+    if (!scanHistory.length || scanHistory[0].timestamp !== currentScan.timestamp) {
+      scanHistory.unshift(currentScan);
+      saveScanHistory(scanHistory);
+    }
+    {% endif %}
+
+    if (historyList) {
+      historyList.addEventListener("click", function (event) {
+        if (!event.target.classList.contains("agri-scan-history-delete")) return;
+        var index = parseInt(event.target.getAttribute("data-index"), 10);
+        var items = getScanHistory();
+        items.splice(index, 1);
+        saveScanHistory(items);
+        renderScanHistory();
+      });
+    }
+
+    renderScanHistory();
   });
 
   function exportToPDF() {
