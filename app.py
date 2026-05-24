@@ -837,6 +837,41 @@ def stories():
     return render_template("stories.html")
 
 
+@app.route("/dashboard")
+def dashboard():
+    farms = [
+        {
+            "name": "GreenGrid Hub — Gujarat",
+            "health": 82,
+            "stage": "Matured Boll",
+            "disease_risk": "Low",
+            "yield_est": 740,
+        },
+        {
+            "name": "North Field — Punjab",
+            "health": 61,
+            "stage": "Early Boll",
+            "disease_risk": "Medium",
+            "yield_est": 520,
+        },
+        {
+            "name": "West Field — Maharashtra",
+            "health": 45,
+            "stage": "Cotton Bud",
+            "disease_risk": "High",
+            "yield_est": 310,
+        },
+        {
+            "name": "East Field — Rajasthan",
+            "health": 91,
+            "stage": "Split Cotton Boll",
+            "disease_risk": "Low",
+            "yield_est": 860,
+        },
+    ]
+    return render_template("dashboard.html", farms=farms)
+
+
 @app.route("/health")
 def health():
     ensure_models_loaded()
@@ -1398,6 +1433,7 @@ if __name__ == "__main__":
     logger.info("/              - Home page")
     logger.info("/analyze       - Upload and analyze image")
     logger.info("/comparison    - Compare two field images")
+    logger.info("/dashboard     - Multi-farm comparison dashboard")
     logger.info("/demo          - View demo results")
     logger.info("/api/analyze   - API endpoint (POST)")
     logger.info("/health        - Health check")
