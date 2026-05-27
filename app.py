@@ -42,6 +42,7 @@ from jinja2 import Environment, FileSystemLoader
 from model_registry import registry
 from services.weather_service import generate_weather_recommendations
 from services.yield_service import estimate_yield
+from services.recommendation_engine import get_recommendations as get_treatment_recommendations
 
 load_dotenv()
 
@@ -749,6 +750,13 @@ def analyze_image(image: np.ndarray) -> Dict[str, Any]:
         adv_recs = generate_advanced_recommendations(disease, growth)
         insights = generate_farmer_insights(disease, growth)
 
+        # Context-aware treatment recommendations from the recommendation engine
+        treatment_recs = get_treatment_recommendations(
+            crop_type="cotton",
+            disease_name=disease.get("predicted_class", ""),
+            confidence=disease.get("confidence"),
+        )
+
         result = {
             "disease": disease,
             "growth": growth,
@@ -759,6 +767,7 @@ def analyze_image(image: np.ndarray) -> Dict[str, Any]:
             "yield_estimate": yield_est,
             "advanced_recommendations": adv_recs,
             "farmer_insights": insights,
+            "treatment_recommendations": treatment_recs,
         }
 
         if growth.get("main_class") is None:
@@ -1231,6 +1240,7 @@ def analyze():
                 grad_cam_image_b64=results.get("grad_cam_image_b64"),
                 heatmap_only_b64=results.get("heatmap_only_b64"),
                 disease_info=disease_info,
+                treatment_recommendations=results.get("treatment_recommendations", {}),
             )
         except Exception as exc:
             logger.error("Analysis error: %s", exc)
@@ -1449,6 +1459,13 @@ def demo():
         # Generate farmer insights
         insights = generate_farmer_insights(demo_disease, demo_growth)
 
+        # Context-aware treatment recommendations for demo
+        demo_treatment_recs = get_treatment_recommendations(
+            crop_type="cotton",
+            disease_name=demo_disease.get("predicted_class", "Healthy"),
+            confidence=demo_disease.get("confidence"),
+        )
+
         example_json = {
         "disease": demo_disease,
         "growth": demo_growth,
@@ -1457,7 +1474,8 @@ def demo():
         "disease_severity": severity,
         "yield_estimate": yield_est,
         "advanced_recommendations": adv_recs,
-        "farmer_insights": insights
+        "farmer_insights": insights,
+        "treatment_recommendations": demo_treatment_recs,
         }
         return render_template(
         "results.html",
@@ -1468,7 +1486,8 @@ def demo():
         raw_json=json.dumps(example_json, indent=2),
         timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         grad_cam_image_b64=grad_cam_image_b64,
-        yield_estimate=yield_est # Also pass as top-level for robustness
+        yield_estimate=yield_est, # Also pass as top-level for robustness
+        treatment_recommendations=demo_treatment_recs,
         )
 
     except Exception as e:
