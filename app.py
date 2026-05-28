@@ -22,6 +22,7 @@ import torch.nn.functional as F
 from PIL import Image
 from torchvision import transforms
 from ultralytics import YOLO
+from werkzeug.utils import secure_filename
 from dotenv import load_dotenv
 
 from flask import (
@@ -50,7 +51,17 @@ from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 
 from model_registry import registry
-from services.weather_service import generate_weather_recommendations, geocode_city, get_weather
+from services.weather_service import (
+    generate_weather_recommendations,
+    geocode_city,
+    get_weather,
+)
+from services.gradcam import (
+    GradCAM,
+    apply_heatmap_on_image,
+    generate_gradcam_explanation,
+    generate_pure_heatmap,
+)
 from services.yield_service import estimate_yield
 from services.recommendation_engine import get_recommendations as get_treatment_recommendations
 
@@ -63,10 +74,6 @@ app = Flask(__name__, static_folder="static", template_folder="templates")
 
 # Try dynamic package loading to prevent crash on automated CI testing rigs
 try:
-    import redis
-    from flask_limiter import Limiter
-    from flask_limiter.util import get_remote_address
-
     redis_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
     redis_client.ping()
     logger.info("redis connected for caching and rate limiting")
@@ -136,6 +143,7 @@ LANG = {
 
 os.makedirs("static/uploads", exist_ok=True)
 os.makedirs("static/css", exist_ok=True)
+os.makedirs("static/generated/gradcam", exist_ok=True)
 os.makedirs("models", exist_ok=True)
 
 ALLOWED_IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "gif"}
@@ -338,94 +346,9 @@ def generate_mock_heatmap(image_rgb: np.ndarray) -> np.ndarray:
     heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
     return heatmap
 
-def generate_pure_heatmap(image_rgb: np.ndarray, heatmap: np.ndarray) -> np.ndarray:
-    h, w, _ = image_rgb.shape
-    heatmap_resized = cv2.resize(heatmap, (w, h))
-    heatmap_255 = np.uint8(255 * heatmap_resized)
-    heatmap_color = cv2.applyColorMap(heatmap_255, cv2.COLORMAP_JET)
-    return cv2.cvtColor(heatmap_color, cv2.COLOR_BGR2RGB)
-
-def apply_heatmap_on_image(image_rgb: np.ndarray, heatmap: np.ndarray, alpha: float = 0.6, beta: float = 0.4) -> np.ndarray:
-    heatmap_color_rgb = generate_pure_heatmap(image_rgb, heatmap)
-    return cv2.addWeighted(image_rgb, alpha, heatmap_color_rgb, beta, 0)
-
-class GradCAM:
-    def __init__(self, model: torch.nn.Module, target_layer: torch.nn.Module):
-        self.model = model
-        self.target_layer = target_layer
-        self.gradients = None
-        self.activations = None
-        self.heatmap_np = None
-        self.forward_handle = self.target_layer.register_forward_hook(self._save_activation)
-        self.backward_handle = self.target_layer.register_full_backward_hook(self._save_gradient)
-
-    def cleanup(self) -> None:
-        if getattr(self, "forward_handle", None) is not None:
-            self.forward_handle.remove()
-            self.forward_handle = None
-        if getattr(self, "backward_handle", None) is not None:
-            self.backward_handle.remove()
-            self.backward_handle = None
-
-    def __enter__(self) -> "GradCAM":
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        self.cleanup()
-
-    def _save_activation(self, module, inputs, output):
-        self.activations = output.detach()
-
-    def _save_gradient(self, module, grad_input, grad_output):
-        if grad_output and grad_output[0] is not None:
-            self.gradients = grad_output[0].detach()
-
-    def __call__(self, input_tensor: torch.Tensor, target_class_idx: Optional[int], original_image_rgb: np.ndarray) -> Optional[np.ndarray]:
-        if self.model is None:
-            return None
-
-        self.model.eval()
-        self.model.zero_grad(set_to_none=True)
-        self.activations = None
-        self.gradients = None
-        self.heatmap_np = None
-
-        try:
-            device = next(self.model.parameters()).device
-            input_tensor = input_tensor.to(device)
-
-            with torch.enable_grad():
-                output = self.model(input_tensor)
-                if target_class_idx is None:
-                    target_class_idx = int(output.argmax(dim=1).item())
-
-                score = output[:, target_class_idx].sum()
-                score.backward()
-
-                if self.activations is None or self.gradients is None:
-                    return None
-
-                pooled_gradients = torch.mean(self.gradients, dim=(2, 3))
-                weighted_activations = self.activations * pooled_gradients[:, :, None, None]
-                heatmap = torch.sum(weighted_activations, dim=1).squeeze()
-                heatmap = F.relu(heatmap)
-
-                max_val = torch.max(heatmap)
-                if float(max_val.item()) == 0.0:
-                    heatmap = torch.zeros_like(heatmap)
-                else:
-                    heatmap = heatmap / max_val
-
-                heatmap_np = heatmap.detach().cpu().numpy()
-                self.heatmap_np = heatmap_np
-                return apply_heatmap_on_image(original_image_rgb, heatmap_np)
-
-        except Exception as exc:
-            logger.error("Grad-CAM error: %s", exc)
-            return None
-        finally:
-            self.gradients = None
-            self.activations = None
+# -------------------------------------------------------------------
+# INFERENCE PIPELINE
+# -------------------------------------------------------------------
 
 def preprocess_image_for_resnet(image: np.ndarray, target_size: Tuple[int, int] = (224, 224)) -> torch.Tensor:
     transform = transforms.Compose([
@@ -623,7 +546,6 @@ def calculate_file_hash(file_storage) -> str:
     return sha256_hash.hexdigest()
 
 def read_uploaded_image(file_storage) -> Tuple[str, np.ndarray, np.ndarray]:
-    from werkzeug.utils import secure_filename
     safe_filename = secure_filename(file_storage.filename)
     file_bytes = np.frombuffer(file_storage.read(), np.uint8)
     image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
@@ -635,18 +557,105 @@ GRAD_CAM_CACHE = {}
 GRAD_CAM_CACHE_LOCK = threading.Lock()
 MAX_CACHE_SIZE = 100
 
-def get_cached_grad_cam(image_hash: str) -> Optional[Tuple[str, str]]:
+def get_cached_grad_cam(image_hash: str) -> Optional[Dict[str, Any]]:
     with GRAD_CAM_CACHE_LOCK:
         return GRAD_CAM_CACHE.get(image_hash)
 
-def set_cached_grad_cam(image_hash: str, overlay_b64: str, heatmap_only_b64: str) -> None:
+def set_cached_grad_cam(
+    image_hash: str,
+    overlay_b64: Optional[str],
+    heatmap_only_b64: Optional[str],
+    overlay_path: Optional[str] = None,
+    heatmap_path: Optional[str] = None,
+    explainability: Optional[Dict[str, Any]] = None,
+) -> None:
     with GRAD_CAM_CACHE_LOCK:
         if len(GRAD_CAM_CACHE) >= MAX_CACHE_SIZE:
             first_key = next(iter(GRAD_CAM_CACHE))
             GRAD_CAM_CACHE.pop(first_key, None)
-        GRAD_CAM_CACHE[image_hash] = (overlay_b64, heatmap_only_b64)
+        GRAD_CAM_CACHE[image_hash] = {
+            "grad_cam_image_b64": overlay_b64,
+            "heatmap_only_b64": heatmap_only_b64,
+            "heatmap_image_path": overlay_path,
+            "heatmap_only_path": heatmap_path,
+            "explainability": explainability or {
+                "available": bool(overlay_b64 and heatmap_only_b64),
+                "status": "generated" if overlay_b64 and heatmap_only_b64 else "unavailable",
+                "target_layer": "ResNet50 layer4[-1]",
+            },
+        }
+
+
+def build_gradcam_payload(
+    image: np.ndarray,
+    disease: Dict[str, Any],
+    model: Optional[torch.nn.Module],
+) -> Dict[str, Any]:
+    image_hash = hashlib.sha256(image.tobytes()).hexdigest()
+    cached_result = get_cached_grad_cam(image_hash)
+    if cached_result is not None:
+        logger.info("Using cached Grad-CAM heatmap")
+        return cached_result
+
+    payload = {
+        "grad_cam_image_b64": None,
+        "heatmap_only_b64": None,
+        "heatmap_image_path": None,
+        "heatmap_only_path": None,
+        "explainability": {
+            "available": False,
+            "status": "unavailable",
+            "target_layer": "ResNet50 layer4[-1]",
+        },
+    }
+
+    if model is None or disease.get("predicted_class_idx") is None:
+        return payload
+
+    try:
+        input_tensor = preprocess_image_for_resnet(image)
+        gradcam_result = generate_gradcam_explanation(
+            model=model,
+            input_tensor=input_tensor,
+            image_rgb=image,
+            target_class_idx=disease.get("predicted_class_idx"),
+            filename_prefix=image_hash[:16],
+        )
+        payload["explainability"] = {
+            "available": gradcam_result.available,
+            "status": gradcam_result.status,
+            "target_layer": gradcam_result.target_layer,
+        }
+        if gradcam_result.error:
+            payload["explainability"]["error"] = gradcam_result.error
+
+        if gradcam_result.available and gradcam_result.overlay_image is not None and gradcam_result.heatmap_image is not None:
+            payload["grad_cam_image_b64"] = encode_image_for_display(gradcam_result.overlay_image)
+            payload["heatmap_only_b64"] = encode_image_for_display(gradcam_result.heatmap_image)
+            payload["heatmap_image_path"] = gradcam_result.overlay_path
+            payload["heatmap_only_path"] = gradcam_result.heatmap_path
+            set_cached_grad_cam(
+                image_hash,
+                payload["grad_cam_image_b64"],
+                payload["heatmap_only_b64"],
+                payload["heatmap_image_path"],
+                payload["heatmap_only_path"],
+                payload["explainability"],
+            )
+    except Exception as exc:
+        logger.exception("Grad-CAM visualization failed: %s", exc)
+        payload["explainability"] = {
+            "available": False,
+            "status": "failed",
+            "target_layer": "ResNet50 layer4[-1]",
+            "error": str(exc),
+        }
+
+    return payload
 
 def analyze_image(image: np.ndarray) -> Dict[str, Any]:
+    import time
+    start_time = time.time()
     resnet_model, yolo_model = model_manager.load_models()
     try:
         try:
@@ -659,45 +668,38 @@ def analyze_image(image: np.ndarray) -> Dict[str, Any]:
         if not isinstance(disease, dict) or "predicted_class" not in disease or "health_score" not in disease:
             raise ValueError("Invalid disease model prediction output.")
 
-        image_hash = hashlib.sha256(image.tobytes()).hexdigest()
-        cached_result = get_cached_grad_cam(image_hash)
-        
-        grad_cam_image_b64 = None
-        heatmap_only_b64 = None
-        
-        if cached_result is not None:
-            grad_cam_image_b64, heatmap_only_b64 = cached_result
-        else:
-            if resnet_model is not None and disease.get("predicted_class_idx") is not None:
-                try:
-                    input_tensor = preprocess_image_for_resnet(image)
-                    with GradCAM(resnet_model, resnet_model.layer4[-1]) as grad_cam:
-                        grad_cam_overlay = grad_cam(input_tensor, disease["predicted_class_idx"], image)
-                        heatmap_np = getattr(grad_cam, "heatmap_np", None)
-                    if grad_cam_overlay is not None:
-                        grad_cam_image_b64 = encode_image_for_display(grad_cam_overlay)
-                    if heatmap_np is not None:
-                        pure_heatmap_rgb = generate_pure_heatmap(image, heatmap_np)
-                        heatmap_only_b64 = encode_image_for_display(pure_heatmap_rgb)
-                except Exception as exc:
-                    logger.error("Error generating Grad-CAM: %s", exc)
-
-            if grad_cam_image_b64 is None or heatmap_only_b64 is None:
-                try:
-                    mock_heatmap = generate_mock_heatmap(image)
-                    mock_overlay = apply_heatmap_on_image(image, mock_heatmap)
-                    grad_cam_image_b64 = encode_image_for_display(mock_overlay)
-                    
-                    pure_heatmap_rgb = generate_pure_heatmap(image, mock_heatmap)
-                    heatmap_only_b64 = encode_image_for_display(pure_heatmap_rgb)
-                except Exception as exc:
-                    logger.error("Error generating fallback heatmap: %s", exc)
-            
-            if grad_cam_image_b64 and heatmap_only_b64:
-                set_cached_grad_cam(image_hash, grad_cam_image_b64, heatmap_only_b64)
+        gradcam_payload = build_gradcam_payload(image, disease, resnet_model)
+        grad_cam_image_b64 = gradcam_payload.get("grad_cam_image_b64")
+        heatmap_only_b64 = gradcam_payload.get("heatmap_only_b64")
 
         disease["heatmap_b64"] = grad_cam_image_b64
         disease["heatmap_only_b64"] = heatmap_only_b64
+        disease["heatmap_image_path"] = gradcam_payload.get("heatmap_image_path")
+        disease["heatmap_only_path"] = gradcam_payload.get("heatmap_only_path")
+        disease["explainability"] = gradcam_payload.get("explainability")
+        
+        # Track metrics in registry
+        inference_time = time.time() - start_time
+        try:
+            if disease and disease.get("confidence"):
+                registry.update_metrics(
+                    model_type="resnet",
+                    version="v1.0",
+                    confidence=disease.get("confidence", 0.0),
+                    inference_time=inference_time,
+                    success=True
+                )
+            
+            if growth and growth.get("confidence"):
+                registry.update_metrics(
+                    model_type="yolo",
+                    version="v1.0",
+                    confidence=growth.get("confidence", 0.0),
+                    inference_time=inference_time,
+                    success=True
+                )
+        except Exception as e:
+            logger.error(f"Error tracking metrics: {e}")
 
         recs = generate_recommendations(disease, growth)
         severity = calculate_disease_severity(disease["health_score"])
@@ -718,6 +720,9 @@ def analyze_image(image: np.ndarray) -> Dict[str, Any]:
             "recommendations": recs,
             "grad_cam_image_b64": grad_cam_image_b64,
             "heatmap_only_b64": heatmap_only_b64,
+            "heatmap_image_path": gradcam_payload.get("heatmap_image_path"),
+            "heatmap_only_path": gradcam_payload.get("heatmap_only_path"),
+            "explainability": gradcam_payload.get("explainability"),
             "disease_severity": severity,
             "yield_estimate": yield_est,
             "advanced_recommendations": adv_recs,
@@ -1078,6 +1083,233 @@ def export_pdf():
         logger.error(f"Error generating PDF: {e}")
         return jsonify({"error": str(e)}), 500
 
+
+@app.route('/api/analyze/download-report', methods=['POST'])
+@login_required
+def download_analysis_report():
+    """Generate and download a professional PDF crop analysis report"""
+    try:
+        from reportlab.lib import colors
+        from reportlab.lib.pagesizes import letter
+        from reportlab.lib.units import inch
+        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image as RLImage
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib.enums import TA_CENTER
+        from io import BytesIO
+        import base64
+        from PIL import Image as PILImage
+
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "No data provided"}), 400
+
+        disease_detected = data.get("disease_detected", "Unknown")
+        disease_confidence = data.get("disease_confidence", 0)
+        health_score = data.get("health_score", 0)
+        growth_stage = data.get("growth_stage", "Unknown")
+        growth_confidence = data.get("growth_confidence", 0)
+        image_b64 = data.get("image_b64", "")
+        recommendations = data.get("recommendations", [])
+        timestamp = data.get("timestamp", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        weather_data = data.get("weather_data", {})
+        yield_data = data.get("yield_estimate", {})
+
+        pdf_buffer = BytesIO()
+        doc = SimpleDocTemplate(pdf_buffer, pagesize=letter, topMargin=0.5*inch, bottomMargin=0.5*inch)
+        elements = []
+
+        styles = getSampleStyleSheet()
+        title_style = ParagraphStyle(
+            'CustomTitle',
+            parent=styles['Heading1'],
+            fontSize=24,
+            textColor=colors.HexColor('#2c3e50'),
+            spaceAfter=6,
+            alignment=TA_CENTER,
+            fontName='Helvetica-Bold'
+        )
+        subtitle_style = ParagraphStyle(
+            'CustomSubtitle',
+            parent=styles['Normal'],
+            fontSize=12,
+            textColor=colors.HexColor('#7f8c8d'),
+            spaceAfter=12,
+            alignment=TA_CENTER,
+            fontName='Helvetica'
+        )
+        header_style = ParagraphStyle(
+            'SectionHeader',
+            parent=styles['Heading2'],
+            fontSize=14,
+            textColor=colors.HexColor('#27ae60'),
+            spaceAfter=8,
+            spaceBefore=12,
+            fontName='Helvetica-Bold'
+        )
+        normal_style = ParagraphStyle(
+            'Normal',
+            parent=styles['Normal'],
+            fontSize=10,
+            textColor=colors.HexColor('#2c3e50'),
+            spaceAfter=6
+        )
+
+        title = Paragraph("🌾 Agri-Vision Crop Analysis Report", title_style)
+        elements.append(title)
+        subtitle = Paragraph("Professional Analysis Insights", subtitle_style)
+        elements.append(subtitle)
+        elements.append(Spacer(1, 0.15*inch))
+
+        metadata_data = [
+            ["Report Generated", timestamp],
+            ["Analysis ID", f"AGRI-{datetime.now().strftime('%Y%m%d%H%M%S')}"]
+        ]
+        metadata_table = Table(metadata_data, colWidths=[2*inch, 4*inch])
+        metadata_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (0, -1), colors.HexColor('#ecf0f1')),
+            ('TEXTCOLOR', (0, 0), (-1, -1), colors.HexColor('#2c3e50')),
+            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+            ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, -1), 9),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+            ('TOPPADDING', (0, 0), (-1, -1), 8),
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#bdc3c7'))
+        ]))
+        elements.append(metadata_table)
+        elements.append(Spacer(1, 0.2*inch))
+
+        if image_b64:
+            try:
+                image_data = base64.b64decode(image_b64.split(',')[-1] if ',' in image_b64 else image_b64)
+                img_pil = PILImage.open(BytesIO(image_data))
+                img_width = 6*inch
+                img_height = img_width * img_pil.height / img_pil.width
+                if img_height > 3.5*inch:
+                    img_height = 3.5*inch
+                    img_width = img_height * img_pil.width / img_pil.height
+
+                img_buffer = BytesIO(image_data)
+                rl_image = RLImage(img_buffer, width=img_width, height=img_height)
+                elements.append(rl_image)
+                elements.append(Spacer(1, 0.15*inch))
+            except Exception as e:
+                logger.warning(f"Could not embed image in PDF: {e}")
+
+        elements.append(Paragraph("DISEASE HEALTH ANALYSIS", header_style))
+        disease_data = [
+            ["Detected Issue", str(disease_detected)],
+            ["Confidence Score", f"{float(disease_confidence):.1f}%"],
+            ["Health Score", f"{float(health_score):.1f}%"]
+        ]
+        disease_table = Table(disease_data, colWidths=[2*inch, 4*inch])
+        disease_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (0, -1), colors.HexColor('#e8f5e9')),
+            ('TEXTCOLOR', (0, 0), (-1, -1), colors.HexColor('#1b5e20')),
+            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+            ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, -1), 10),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+            ('TOPPADDING', (0, 0), (-1, -1), 8),
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#a5d6a7'))
+        ]))
+        elements.append(disease_table)
+        elements.append(Spacer(1, 0.15*inch))
+
+        elements.append(Paragraph("GROWTH STAGE DETECTION", header_style))
+        growth_data = [
+            ["Current Stage", str(growth_stage)],
+            ["Stage Confidence", f"{float(growth_confidence):.1f}%"]
+        ]
+        growth_table = Table(growth_data, colWidths=[2*inch, 4*inch])
+        growth_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (0, -1), colors.HexColor('#e3f2fd')),
+            ('TEXTCOLOR', (0, 0), (-1, -1), colors.HexColor('#1565c0')),
+            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+            ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, -1), 10),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+            ('TOPPADDING', (0, 0), (-1, -1), 8),
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#90caf9'))
+        ]))
+        elements.append(growth_table)
+        elements.append(Spacer(1, 0.15*inch))
+
+        if weather_data:
+            elements.append(Paragraph("WEATHER CONDITIONS", header_style))
+            weather_rows = []
+            if weather_data.get('temperature') is not None:
+                weather_rows.append(["Temperature", f"{weather_data.get('temperature')}°C"])
+            if weather_data.get('humidity') is not None:
+                weather_rows.append(["Humidity", f"{weather_data.get('humidity')}%"])
+            if weather_data.get('precipitation') is not None:
+                weather_rows.append(["Precipitation", f"{weather_data.get('precipitation')} mm"])
+            if weather_data.get('description'):
+                weather_rows.append(["Condition", weather_data.get('description')])
+
+            if weather_rows:
+                weather_table = Table(weather_rows, colWidths=[2*inch, 4*inch])
+                weather_table.setStyle(TableStyle([
+                    ('BACKGROUND', (0, 0), (0, -1), colors.HexColor('#fff3e0')),
+                    ('TEXTCOLOR', (0, 0), (-1, -1), colors.HexColor('#e65100')),
+                    ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+                    ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+                    ('FONTSIZE', (0, 0), (-1, -1), 10),
+                    ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+                    ('TOPPADDING', (0, 0), (-1, -1), 8),
+                    ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#ffe0b2'))
+                ]))
+                elements.append(weather_table)
+                elements.append(Spacer(1, 0.15*inch))
+
+        if yield_data:
+            elements.append(Paragraph("YIELD ESTIMATE", header_style))
+            yield_rows = []
+            if yield_data.get('yield_min_acre') and yield_data.get('yield_max_acre'):
+                yield_rows.append(["Per Acre Estimate", f"{yield_data.get('yield_min_acre')}–{yield_data.get('yield_max_acre')} q/acre"])
+            if yield_data.get('yield_min_total') and yield_data.get('yield_max_total'):
+                yield_rows.append(["Total Field Estimate", f"{yield_data.get('yield_min_total')}–{yield_data.get('yield_max_total')} quintals"])
+
+            if yield_rows:
+                yield_table = Table(yield_rows, colWidths=[2*inch, 4*inch])
+                yield_table.setStyle(TableStyle([
+                    ('BACKGROUND', (0, 0), (0, -1), colors.HexColor('#f3e5f5')),
+                    ('TEXTCOLOR', (0, 0), (-1, -1), colors.HexColor('#4a148c')),
+                    ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+                    ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+                    ('FONTSIZE', (0, 0), (-1, -1), 10),
+                    ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+                    ('TOPPADDING', (0, 0), (-1, -1), 8),
+                    ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#e1bee7'))
+                ]))
+                elements.append(yield_table)
+                elements.append(Spacer(1, 0.15*inch))
+
+        if recommendations:
+            elements.append(Paragraph("RECOMMENDATIONS", header_style))
+            rec_text = ""
+            for i, rec in enumerate(recommendations[:10], 1):
+                rec_text += f"• {rec}<br/>"
+            elements.append(Paragraph(rec_text, normal_style))
+            elements.append(Spacer(1, 0.1*inch))
+
+        elements.append(Spacer(1, 0.2*inch))
+        footer_text = "Generated by Agri-Vision Cotton Analysis System | For professional agricultural guidance, consult local extension officers"
+        elements.append(Paragraph(footer_text, ParagraphStyle('Footer', parent=styles['Normal'], fontSize=8, textColor=colors.HexColor('#95a5a6'), alignment=TA_CENTER)))
+
+        doc.build(elements)
+        pdf_buffer.seek(0)
+
+        return send_file(
+            pdf_buffer,
+            mimetype='application/pdf',
+            as_attachment=True,
+            download_name=f'agri_vision_crop_analysis_{datetime.now().strftime("%Y%m%d_%H%M%S")}.pdf'
+        )
+
+    except Exception as e:
+        logger.error(f"Error generating analysis PDF: {e}")
+        return jsonify({"error": f"Failed to generate PDF: {str(e)}"}), 500
+
 @app.route("/history")
 def history():
     return render_template("history.html")
@@ -1151,6 +1383,8 @@ def analyze():
                 weather=weather,
                 grad_cam_image_b64=results.get("grad_cam_image_b64"),
                 heatmap_only_b64=results.get("heatmap_only_b64"),
+                heatmap_image_path=results.get("heatmap_image_path"),
+                heatmap_only_path=results.get("heatmap_only_path"),
                 disease_info=disease_info,
                 treatment_recommendations=results.get("treatment_recommendations", {}),
             )
@@ -1327,11 +1561,17 @@ def demo():
         cv2.ellipse(synthetic_bgr, (345, 185), (35, 15), 0, 0, 360, (30, 50, 90), -1)
 
         synthetic_rgb = cv2.cvtColor(synthetic_bgr, cv2.COLOR_BGR2RGB)
-        mock_overlay = apply_heatmap_on_image(synthetic_rgb, generate_mock_heatmap(synthetic_rgb))
+        
+        # generate mock fallback heatmap
+        from services.gradcam import generate_pure_heatmap
+        mock_heatmap_np = generate_mock_heatmap(synthetic_rgb)
+        pure_heatmap_rgb = generate_pure_heatmap(synthetic_rgb, mock_heatmap_np)
+        mock_overlay = cv2.addWeighted(synthetic_rgb, 0.6, pure_heatmap_rgb, 0.4, 0)
+        
         image_b64 = encode_image_for_display(synthetic_rgb)
         grad_cam_image_b64 = encode_image_for_display(mock_overlay)
+        heatmap_only_b64 = encode_image_for_display(pure_heatmap_rgb)
 
-        # Context-aware treatment recommendations for demo
         demo_treatment_recs = get_treatment_recommendations(
             crop_type="cotton",
             disease_name=demo_disease.get("predicted_class", "Healthy"),
@@ -1339,28 +1579,36 @@ def demo():
         )
 
         example_json = {
-        "disease": demo_disease,
-        "growth": demo_growth,
-        "recommendations": generate_recommendations(demo_disease, demo_growth),
-        "grad_cam_image_b64": grad_cam_image_b64,
-        "disease_severity": calculate_disease_severity(demo_disease["health_score"]),
-        "yield_estimate": estimate_yield(demo_disease, demo_growth, weather=None, field_acres=1.0),
-        "advanced_recommendations": generate_advanced_recommendations(demo_disease, demo_growth),
-        "farmer_insights": generate_farmer_insights(demo_disease, demo_growth),
-        "treatment_recommendations": demo_treatment_recs,
+            "disease": demo_disease,
+            "growth": demo_growth,
+            "recommendations": generate_recommendations(demo_disease, demo_growth),
+            "grad_cam_image_b64": grad_cam_image_b64,
+            "heatmap_only_b64": heatmap_only_b64,
+            "heatmap_image_path": None,
+            "heatmap_only_path": None,
+            "disease_severity": calculate_disease_severity(demo_disease["health_score"]),
+            "yield_estimate": estimate_yield(demo_disease, demo_growth, weather=None, field_acres=1.0),
+            "advanced_recommendations": generate_advanced_recommendations(demo_disease, demo_growth),
+            "farmer_insights": generate_farmer_insights(demo_disease, demo_growth),
+            "treatment_recommendations": demo_treatment_recs,
         }
 
         return render_template(
-        "results.html",
-        results=example_json,
-        filename="demo_cotton.jpg",
-        image_b64=image_b64,
-        img_shape={"width": 512, "height": 384},
-        raw_json=json.dumps(example_json, indent=2),
-        timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        grad_cam_image_b64=grad_cam_image_b64,
-        yield_estimate=example_json["yield_estimate"], # Also pass as top-level for robustness
-        treatment_recommendations=demo_treatment_recs,
+            "results.html",
+            results=example_json,
+            filename="demo_cotton.jpg",
+            image_b64=image_b64,
+            img_shape={"width": 512, "height": 384},
+            raw_json=json.dumps(example_json, indent=2),
+            timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            grad_cam_image_b64=grad_cam_image_b64,
+            heatmap_only_b64=heatmap_only_b64,
+            heatmap_image_path=None,
+            heatmap_only_path=None,
+            yield_estimate=example_json["yield_estimate"],
+            disease_info=disease_info_map.get("Healthy", {}),
+            treatment_recommendations=demo_treatment_recs,
+            weather=None
         )
     except Exception as e:
         logger.error(f"Demo route failed: {e}")
@@ -1507,6 +1755,125 @@ def api_analyze():
         
     except Exception as e:
         logger.error(f"API analysis error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route("/api/analyze_stream", methods=["POST"])
+def api_analyze_stream():
+    """Streaming endpoint for real-time analysis progress"""
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file uploaded'}), 400
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({'error': 'No file selected'}), 400
+    
+    def generate():
+        try:
+            yield f"data: {json.dumps({'status': 'uploading', 'progress': 25})}\n\n"
+            
+            file_bytes = np.frombuffer(file.read(), np.uint8)
+            image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+            if image is None:
+                yield f"data: {json.dumps({'status': 'error', 'message': 'Invalid image file'})}\n\n"
+                return
+            
+            yield f"data: {json.dumps({'status': 'analyzing', 'progress': 50})}\n\n"
+            
+            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            compressed_rgb = resize_image(image_rgb, MAX_INFERENCE_DIMENSION)
+            results = analyze_image(compressed_rgb)
+            if results.get("error"):
+                yield f"data: {json.dumps({'status': 'error', 'message': results['error']})}\n\n"
+                return
+                
+            yield f"data: {json.dumps({'status': 'generating', 'progress': 75})}\n\n"
+            yield f"data: {json.dumps({'status': 'complete', 'progress': 100, 'results': results})}\n\n"
+        except Exception as e:
+            logger.error(f"Streaming analysis error: {e}")
+            yield f"data: {json.dumps({'status': 'error', 'message': str(e)})}\n\n"
+    
+    return Response(stream_with_context(generate()), mimetype='text/event-stream')
+
+# --- Batch Processing Endpoints ---
+@app.route("/api/batch_upload", methods=["POST"])
+def api_batch_upload():
+    """Upload multiple images for batch analysis"""
+    try:
+        if 'files' not in request.files:
+            return jsonify({'error': 'No files uploaded'}), 400
+        
+        files = request.files.getlist('files')
+        if not files or files[0].filename == '':
+            return jsonify({'error': 'No files selected'}), 400
+        
+        valid_files = []
+        for file in files:
+            if file and allowed_file(file.filename):
+                valid_files.append(file)
+        
+        if not valid_files:
+            return jsonify({'error': 'No valid image files'}), 400
+        
+        from models import BatchJob, db, AnalysisResult
+        job = BatchJob(
+            total_images=len(valid_files),
+            status='pending'
+        )
+        db.session.add(job)
+        db.session.commit()
+        
+        images_data = []
+        for file in valid_files:
+            file_data = file.read()
+            images_data.append((file.filename, file_data))
+            
+        import cv2
+        import numpy as np
+        for idx, (filename, image_data) in enumerate(images_data):
+            try:
+                file_bytes = np.frombuffer(image_data, np.uint8)
+                image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+                if image is not None:
+                    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                    results = analyze_image(image_rgb)
+                    
+                    result = AnalysisResult(
+                        batch_job_id=job.id,
+                        image_name=filename,
+                        image_index=idx,
+                        status='complete',
+                        disease_class=results.get('disease', {}).get('predicted_class'),
+                        disease_confidence=results.get('disease', {}).get('confidence'),
+                        health_score=results.get('disease', {}).get('health_score'),
+                        growth_class=results.get('growth', {}).get('main_class'),
+                        growth_confidence=results.get('growth', {}).get('confidence'),
+                        results_json=results
+                    )
+                    db.session.add(result)
+            except Exception as e:
+                logger.error(f"Error processing image {filename}: {e}")
+                result = AnalysisResult(
+                    batch_job_id=job.id,
+                    image_name=filename,
+                    image_index=idx,
+                    status='error',
+                    error_message=str(e)
+                )
+                db.session.add(result)
+        
+        job.status = 'completed'
+        job.completed_at = datetime.utcnow()
+        db.session.commit()
+        
+        return jsonify({
+            'status': 'success',
+            'job_id': job.id,
+            'total_images': len(valid_files),
+            'celery_enabled': False,
+            'message': f'Batch job {job.id} started with {len(valid_files)} images'
+        })
+        
+    except Exception as e:
+        logger.error(f"Batch upload error: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route("/api/batch_status/<job_id>", methods=["GET"])
