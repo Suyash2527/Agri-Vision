@@ -171,17 +171,11 @@
             line-height: 1.4;
             white-space: pre-wrap;
         }
-        .ai-message {
-            background: var(--bg-chat-ai, #e8f5e9);
-            color: var(--text-color, #333333);
-            align-self: flex-start;
-            border-bottom-left-radius: 4px;
-        }
         .user-message {
-            background: var(--emerald-green, #2e8b57);
-            color: #ffffff;
-            align-self: flex-end;
-            border-bottom-right-radius: 4px;
+           background: linear-gradient(135deg, #2e8b57, #3cb371);
+           color: #ffffff;
+           align-self: flex-end;
+           border-bottom-right-radius: 4px;
         }
 
         /* 8. Error message card */
@@ -249,16 +243,17 @@
         }
 
         /* 11. Dark theme overrides */
-        [data-theme="dark"] {
-            --bg-chat-ai: rgba(92, 209, 139, 0.15);
-        }
-        [data-theme="dark"] .ai-message {
-            color: #e0e0e0;
-        }
-        [data-theme="dark"] .user-message {
-            color: #121212;
+        .ai-message {
+         background: #e8f5e9;
+         color: #222222;
+         align-self: flex-start;
+         border-bottom-left-radius: 4px;
         }
 
+        [data-theme="dark"] .ai-message {
+          background: #2b3d33;
+          color: #ffffff;
+        }        
         /* 12. Mobile responsive */
         @media (max-width: 480px) {
             .chatbot-widget {
@@ -294,6 +289,14 @@
                 opacity: 0.7;
             }
         }
+<<<<<<< HEAD
+        [data-theme="dark"] .user-message {
+          background: linear-gradient(135deg, #16a34a, #14532d) !important;
+          color: #ffffff !important;
+          border: 1px solid rgba(255,255,255,0.08);
+          box-shadow: 0 2px 10px rgba(0,0,0,0.25);
+        }
+=======
 
         /* Mobile Navigation Styles */
         .nav-toggle {
@@ -475,6 +478,7 @@
             }
         }
 
+>>>>>>> 0d24408e2cda98d92efd5a9f69935bc9bc9dfb87
     </style>
 <script type="text/javascript">
 function googleTranslateElementInit() {
