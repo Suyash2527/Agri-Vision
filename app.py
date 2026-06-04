@@ -14,8 +14,11 @@ import threading
 from datetime import datetime
 from typing import Any, Dict, Optional, Tuple
 from werkzeug.utils import secure_filename
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 from io import BytesIO
 
+import redis
 import base64
 import cv2
 import numpy as np
@@ -44,6 +47,13 @@ from jinja2 import Environment, FileSystemLoader
 from model_registry import registry
 from services.weather_service import generate_weather_recommendations
 from services.yield_service import estimate_yield
+from security_utils import (
+    UploadValidationError,
+    cleanup_temp_upload,
+    resolve_secret_key,
+    save_temp_upload,
+    validate_image_upload,
+)
 
 load_dotenv()
 
@@ -55,6 +65,34 @@ app = Flask(__name__, static_folder="static", template_folder="templates")
 # --- Database Configuration ---
 app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL', 'sqlite:///agri_vision.db')
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+# Try dynamic package loading to prevent crash on automated CI testing rigs
+redis_host = os.getenv("REDIS_HOST", "localhost")
+redis_port = int(os.getenv("REDIS_PORT", "6379"))
+redis_db = int(os.getenv("REDIS_DB", "0"))
+limiter_storage_uri = "memory://"
+
+try:
+    redis_client = redis.Redis(
+        host=redis_host,
+        port=redis_port,
+        db=redis_db,
+        decode_responses=True,
+    )
+
+    redis_client.ping()
+    limiter_storage_uri = f"redis://{redis_host}:{redis_port}/{redis_db}"
+    logger.info("redis connected for caching and rate limiting")
+except (redis.exceptions.ConnectionError, ModuleNotFoundError) as err:
+    logger.warning(f"caching layer bypass active: {err}")
+    redis_client = None
+
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    storage_uri=limiter_storage_uri,
+    strategy="fixed-window",
+)
 from models import db
 db.init_app(app)
 
@@ -69,6 +107,17 @@ login_manager.login_message_category = 'info'
 def load_user(user_id):
     from models import User
     return User.query.get(user_id)
+
+from functools import wraps
+
+def api_login_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not current_user.is_authenticated:
+            from flask import jsonify
+            return jsonify({"status": "error", "error": "Authentication required"}), 401
+        return f(*args, **kwargs)
+    return decorated
 
 # --- Security Configuration ---
 ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg'}
@@ -92,10 +141,19 @@ app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
 app.jinja_env.auto_reload = True
 app.jinja_env.cache = {}
 
-secret_key = os.getenv("SECRET_KEY") or "dev_secret_123"
+try:
+    secret_key = resolve_secret_key(os.environ)
+except RuntimeError as exc:
+    logger.critical(str(exc))
+    raise SystemExit(str(exc))
 app.secret_key = secret_key
 app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024
 app.config["MAX_FORM_MEMORY_SIZE"] = 25 * 1024 * 1024
+app.config.setdefault("UPLOAD_MAX_BYTES", app.config["MAX_CONTENT_LENGTH"])
+app.config.setdefault("UPLOAD_RATE_LIMIT", "10 per minute")
+app.config.setdefault("API_UPLOAD_RATE_LIMIT", "20 per minute")
+app.config.setdefault("UPLOAD_TMP_DIR", os.path.join(app.instance_path, "uploads"))
+os.makedirs(app.config["UPLOAD_TMP_DIR"], exist_ok=True)
 
 LANG = {
     "en": {"welcome": "Welcome to Agri Vision"},
@@ -107,6 +165,7 @@ os.makedirs("static/css", exist_ok=True)
 os.makedirs("models", exist_ok=True)
 
 ALLOWED_IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "gif"}
+ALLOWED_IMAGE_MIME_TYPES = {"image/png", "image/jpeg", "image/gif"}
 MAX_INFERENCE_DIMENSION = 1024
 DISPLAY_IMAGE_MAX_DIMENSION = 1200
 DISPLAY_JPEG_QUALITY = 80
@@ -621,6 +680,15 @@ def generate_advanced_recommendations(disease_result: Dict[str, Any], growth_res
     return adv_recs
 
 
+def generate_treatment_recommendations(disease_result: Dict[str, Any]) -> Dict[str, Any]:
+    from services.recommendation_engine import get_recommendations
+
+    return get_recommendations(
+        "cotton",
+        disease_result.get("predicted_class"),
+        confidence=disease_result.get("confidence"),
+    )
+
 
 def encode_image_for_display(image: np.ndarray) -> str:
     display_image = resize_image(image, DISPLAY_IMAGE_MAX_DIMENSION)
@@ -643,6 +711,32 @@ def calculate_file_hash(file_storage) -> str:
         sha256_hash.update(byte_block)
     file_storage.seek(0)
     return sha256_hash.hexdigest()
+
+
+def get_upload_max_bytes() -> int:
+    max_bytes = app.config.get("UPLOAD_MAX_BYTES") or app.config.get("MAX_CONTENT_LENGTH")
+    return int(max_bytes or 10 * 1024 * 1024)
+
+
+def enforce_request_size(max_bytes: int) -> None:
+    content_length = request.content_length
+    if content_length is not None and content_length > max_bytes:
+        raise UploadValidationError("File exceeds maximum upload size.", status_code=413)
+
+
+def read_validated_upload_image(file_storage) -> Tuple[str, np.ndarray, np.ndarray, str]:
+    max_bytes = get_upload_max_bytes()
+    safe_filename, file_bytes, _mime = validate_image_upload(
+        file_storage,
+        allowed_extensions=ALLOWED_IMAGE_EXTENSIONS,
+        allowed_mime_types=ALLOWED_IMAGE_MIME_TYPES,
+        max_bytes=max_bytes,
+    )
+    temp_path = save_temp_upload(file_bytes, app.config["UPLOAD_TMP_DIR"], safe_filename)
+    image = cv2.imdecode(np.frombuffer(file_bytes, np.uint8), cv2.IMREAD_COLOR)
+    if image is None:
+        raise UploadValidationError("Invalid image file.", status_code=400)
+    return safe_filename, image, cv2.cvtColor(image, cv2.COLOR_BGR2RGB), temp_path
 
 
 def read_uploaded_image(file_storage) -> Tuple[str, np.ndarray, np.ndarray]:
@@ -672,6 +766,25 @@ def set_cached_grad_cam(image_hash: str, overlay_b64: str, heatmap_only_b64: str
             first_key = next(iter(GRAD_CAM_CACHE))
             GRAD_CAM_CACHE.pop(first_key, None)
         GRAD_CAM_CACHE[image_hash] = (overlay_b64, heatmap_only_b64)
+
+
+def generate_gradcam_explanation(
+    resnet_model: torch.nn.Module,
+    image: np.ndarray,
+    disease_result: Dict[str, Any],
+) -> Tuple[Optional[str], Optional[str]]:
+    input_tensor = preprocess_image_for_resnet(image)
+    with GradCAM(resnet_model, resnet_model.layer4[-1]) as grad_cam:
+        grad_cam_overlay = grad_cam(input_tensor, disease_result["predicted_class_idx"], image)
+        heatmap_np = getattr(grad_cam, "heatmap_np", None)
+
+    grad_cam_image_b64 = encode_image_for_display(grad_cam_overlay) if grad_cam_overlay is not None else None
+    heatmap_only_b64 = None
+    if heatmap_np is not None:
+        pure_heatmap_rgb = generate_pure_heatmap(image, heatmap_np)
+        heatmap_only_b64 = encode_image_for_display(pure_heatmap_rgb)
+
+    return grad_cam_image_b64, heatmap_only_b64
 
 
 def analyze_image(image: np.ndarray) -> Dict[str, Any]:
@@ -721,24 +834,25 @@ def analyze_image(image: np.ndarray) -> Dict[str, Any]:
         
         grad_cam_image_b64 = None
         heatmap_only_b64 = None
-        
+        explainability = {"available": False, "status": "unavailable"}
+
         if cached_result is not None:
             grad_cam_image_b64, heatmap_only_b64 = cached_result
+            explainability = {"available": True, "status": "cached"}
             logger.info("Using cached Grad-CAM heatmaps")
         else:
             if resnet_model is not None and disease.get("predicted_class_idx") is not None:
                 try:
-                    input_tensor = preprocess_image_for_resnet(image)
-                    with GradCAM(resnet_model, resnet_model.layer4[-1]) as grad_cam:
-                        grad_cam_overlay = grad_cam(input_tensor, disease["predicted_class_idx"], image)
-                        heatmap_np = getattr(grad_cam, "heatmap_np", None)
-                    if grad_cam_overlay is not None:
-                        grad_cam_image_b64 = encode_image_for_display(grad_cam_overlay)
-                    if heatmap_np is not None:
-                        pure_heatmap_rgb = generate_pure_heatmap(image, heatmap_np)
-                        heatmap_only_b64 = encode_image_for_display(pure_heatmap_rgb)
+                    grad_cam_image_b64, heatmap_only_b64 = generate_gradcam_explanation(
+                        resnet_model,
+                        image,
+                        disease,
+                    )
+                    if grad_cam_image_b64 and heatmap_only_b64:
+                        explainability = {"available": True, "status": "generated"}
                 except Exception as exc:
                     logger.error("Error generating Grad-CAM: %s", exc)
+                    explainability = {"available": False, "status": "failed"}
 
             if grad_cam_image_b64 is None or heatmap_only_b64 is None:
                 try:
@@ -748,6 +862,8 @@ def analyze_image(image: np.ndarray) -> Dict[str, Any]:
                     
                     pure_heatmap_rgb = generate_pure_heatmap(image, mock_heatmap)
                     heatmap_only_b64 = encode_image_for_display(pure_heatmap_rgb)
+                    if explainability["status"] == "unavailable":
+                        explainability = {"available": False, "status": "fallback"}
                 except Exception as exc:
                     logger.error("Error generating fallback heatmap: %s", exc)
             
@@ -761,14 +877,17 @@ def analyze_image(image: np.ndarray) -> Dict[str, Any]:
         severity = calculate_disease_severity(disease["health_score"])
         yield_est = estimate_yield(disease, growth, weather=None, field_acres=1.0)
         adv_recs = generate_advanced_recommendations(disease, growth)
+        treatment_recs = generate_treatment_recommendations(disease)
         insights = generate_farmer_insights(disease, growth)
 
         result = {
             "disease": disease,
             "growth": growth,
             "recommendations": recs,
+            "treatment_recommendations": treatment_recs,
             "grad_cam_image_b64": grad_cam_image_b64,
             "heatmap_only_b64": heatmap_only_b64,
+            "explainability": explainability,
             "disease_severity": severity,
             "yield_estimate": yield_est,
             "advanced_recommendations": adv_recs,
@@ -845,6 +964,13 @@ def build_comparison_result(old_results: Dict[str, Any], new_results: Dict[str, 
     }
 
 
+# --- Security Headers ---
+@app.after_request
+def apply_security_headers(response):
+    response.headers["X-Frame-Options"] = "SAMEORIGIN"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    return response
 # -------------------------------------------------------------------
 # FLASK ROUTES
 # -------------------------------------------------------------------
@@ -905,6 +1031,7 @@ def admin_dashboard():
 # --- Model Management Admin Endpoints ---
 
 @app.route('/admin/models', methods=['GET'])
+@login_required
 def list_models():
     """List all registered models with their metadata"""
     model_type = request.args.get('type')
@@ -1085,6 +1212,7 @@ def set_rollback_threshold():
 
 
 @app.route('/admin/models/export/pdf', methods=['GET'])
+@login_required
 def export_pdf():
     """Export model metrics as PDF"""
     try:
@@ -1182,24 +1310,20 @@ def health():
 
 
 @app.route("/analyze", methods=["GET", "POST"])
+@limiter.limit(lambda: app.config.get("UPLOAD_RATE_LIMIT", "10 per minute"))
 @login_required
 def analyze():
     if request.method == "POST":
-        if "file" not in request.files:
-            flash("No file uploaded", "error")
-            return redirect(request.url)
-
-        file = request.files["file"]
-        if file.filename == "":
-            flash("No file selected", "error")
-            return redirect(request.url)
-
-        if not is_allowed_image(file.filename):
-            flash("Invalid file type. Please upload an image (PNG, JPG, JPEG, GIF)", "error")
-            return redirect(request.url)
-
+        temp_path = None
         try:
-            safe_filename, image, image_rgb = read_uploaded_image(file)
+            enforce_request_size(get_upload_max_bytes())
+
+            if "file" not in request.files:
+                flash("No file uploaded", "error")
+                return redirect(request.url)
+
+            file = request.files["file"]
+            safe_filename, image, image_rgb, temp_path = read_validated_upload_image(file)
             compressed_rgb = resize_image(image_rgb, MAX_INFERENCE_DIMENSION)
             results = analyze_image(compressed_rgb)
 
@@ -1240,15 +1364,24 @@ def analyze():
                 heatmap_only_b64=results.get("heatmap_only_b64"),
                 disease_info=disease_info,
             )
+        except UploadValidationError as exc:
+            logger.warning("Upload rejected: %s", exc)
+            if exc.status_code == 413:
+                return ("File too large", 413)
+            flash(str(exc), "error")
+            return redirect(request.url)
         except Exception as exc:
             logger.error("Analysis error: %s", exc)
             flash(f"Error during analysis: {str(exc)}", "error")
             return redirect(request.url)
+        finally:
+            cleanup_temp_upload(temp_path)
 
     return render_template("upload.html")
 
 
 @app.route("/api/explain", methods=["POST"])
+@api_login_required
 def api_explain():
     if "file" not in request.files:
         return jsonify({"status": "error", "error": "No file uploaded"}), 400
@@ -1287,6 +1420,7 @@ def api_explain():
 
 
 @app.route("/comparison", methods=["GET", "POST"])
+@login_required
 def comparison():
     error_message = None
     old_filename, new_filename, old_image, new_image = None, None, None, None
@@ -1453,7 +1587,8 @@ def demo():
     
         # Generate advanced recommendations
         adv_recs = generate_advanced_recommendations(demo_disease, demo_growth)
-    
+        treatment_recs = generate_treatment_recommendations(demo_disease)
+
         # Generate farmer insights
         insights = generate_farmer_insights(demo_disease, demo_growth)
 
@@ -1461,6 +1596,7 @@ def demo():
         "disease": demo_disease,
         "growth": demo_growth,
         "recommendations": generate_recommendations(demo_disease, demo_growth),
+        "treatment_recommendations": treatment_recs,
         "grad_cam_image_b64": grad_cam_image_b64,
         "disease_severity": severity,
         "yield_estimate": yield_est,
@@ -1576,29 +1712,31 @@ def api_weather():
 
 
 @app.route("/api/analyze", methods=["POST"])
+@limiter.limit(lambda: app.config.get("API_UPLOAD_RATE_LIMIT", "20 per minute"))
 def api_analyze():
-    if 'file' not in request.files:
-        return jsonify({'error': 'No file uploaded'}), 400
-    
-    file = request.files['file']
-    
-    if file.filename == '':
-        return jsonify({'error': 'No file selected'}), 400
+    temp_path = None
     try:
-        file_bytes = np.frombuffer(file.read(), np.uint8)
-        image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-        if image is None:
-            return jsonify({'error': 'Invalid image file'}), 400
-        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        enforce_request_size(get_upload_max_bytes())
+
+        if "file" not in request.files:
+            return jsonify({"error": "No file uploaded"}), 400
+
+        file = request.files["file"]
+        _safe_filename, image, image_rgb, temp_path = read_validated_upload_image(file)
         results = analyze_image(image_rgb)
         return jsonify({
             "status": "success",
             "timestamp": datetime.now().isoformat(),
-            "results": results
+            "results": results,
         })
+    except UploadValidationError as exc:
+        logger.warning("API upload rejected: %s", exc)
+        return jsonify({"error": str(exc)}), exc.status_code
     except Exception as e:
         logger.error(f"API analysis error: {e}")
-        return jsonify({'error': str(e)}), 500
+        return jsonify({"error": str(e)}), 500
+    finally:
+        cleanup_temp_upload(temp_path)
 
 
 @app.route("/api/analyze_stream", methods=["POST"])
@@ -1607,33 +1745,44 @@ def api_analyze_stream():
     if 'file' not in request.files:
         return jsonify({'error': 'No file uploaded'}), 400
     file = request.files['file']
+    image_bytes = file.read()
     if file.filename == '':
         return jsonify({'error': 'No file selected'}), 400
     
     def generate():
         try:
-            # Send progress updates
-            yield f"data: {json.dumps({'status': 'uploading', 'progress': 25})}\n\n"
-            
-            file_bytes = np.frombuffer(file.read(), np.uint8)
-            image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+            yield f"data: {json.dumps({'step': 'upload_received', 'progress': 25, 'message': 'Uploading image...'})}\n\n"
+
+            image = cv2.imdecode(
+                np.frombuffer(image_bytes, np.uint8),
+                cv2.IMREAD_COLOR
+            )
+
             if image is None:
-                yield f"data: {json.dumps({'status': 'error', 'message': 'Invalid image file'})}\n\n"
+                yield f"data: {json.dumps({'step': 'error', 'progress': 0, 'message': 'Invalid image file'})}\n\n"
                 return
-            
-            yield f"data: {json.dumps({'status': 'analyzing', 'progress': 50})}\n\n"
-            
+
+            yield f"data: {json.dumps({'step': 'preprocessing', 'progress': 50, 'message': 'Analyzing crop health...'})}\n\n"
+
             image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             results = analyze_image(image_rgb)
-            
-            yield f"data: {json.dumps({'status': 'generating', 'progress': 75})}\n\n"
-            
-            yield f"data: {json.dumps({'status': 'complete', 'progress': 100, 'results': results})}\n\n"
+
+            yield f"data: {json.dumps({'step': 'recommendations', 'progress': 75, 'message': 'Generating prediction...'})}\n\n"
+
+            yield f"data: {json.dumps({'step': 'complete', 'progress': 100, 'message': 'Analysis complete', 'data': results})}\n\n"
+
         except Exception as e:
             logger.error(f"Streaming analysis error: {e}")
-            yield f"data: {json.dumps({'status': 'error', 'message': str(e)})}\n\n"
-    
-    return Response(stream_with_context(generate()), mimetype='text/event-stream')
+            yield f"data: {json.dumps({'step': 'error', 'progress': 0, 'message': str(e)})}\n\n"
+
+    return Response(
+        stream_with_context(generate()),
+        mimetype='text/event-stream',
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no"
+        }
+    )
 
 
 # --- Batch Processing Endpoints ---
@@ -1690,6 +1839,10 @@ def api_batch_upload():
             import numpy as np
             for idx, (filename, image_data) in enumerate(images_data):
                 try:
+                    file.seek(0)
+                    file_bytes = file.read()
+                    image = cv2.imdecode(np.frombuffer(file_bytes, np.uint8), cv2.IMREAD_COLOR)
+
                     file_bytes = np.frombuffer(image_data, np.uint8)
                     image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
                     if image is not None:
@@ -2689,6 +2842,19 @@ def api_report_disease_occurrence():
         logger.error(f"Error reporting disease occurrence: {e}")
         db.session.rollback()
         return jsonify({'error': str(e)}), 500
+
+
+
+@app.route('/analyze_result', methods=['POST'])
+def analyze_result():
+    payload = request.form.get('payload')
+
+    if not payload:
+        return "No analysis data received", 400
+
+    results = json.loads(payload)
+
+    return render_template('results.html', results=results)
 
 
 if __name__ == '__main__':
