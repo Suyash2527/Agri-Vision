@@ -528,8 +528,52 @@ class RefreshTokenFamily(db.Model):
     )
 
 
+class DeviceSession(db.Model):
+    """Device-based session tracking linked to refresh token families."""
+
+    __tablename__ = "device_sessions"
+
+    id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = db.Column(db.String(36), db.ForeignKey("users.id"), nullable=False, index=True)
+
+    # JWT access token claims
+    session_id = db.Column(db.String(64), nullable=False, index=True)
+
+    # Refresh token family linkage (revocation/compromise fan-out)
+    refresh_token_family_id = db.Column(
+        db.String(36),
+        db.ForeignKey("refresh_token_families.id"),
+        nullable=False,
+        index=True,
+    )
+
+    # Device metadata
+    device_name = db.Column(db.String(120), nullable=True)
+    browser_name = db.Column(db.String(60), nullable=True)
+    operating_system = db.Column(db.String(60), nullable=True)
+    device_type = db.Column(db.String(30), nullable=True)  # desktop, mobile, tablet
+    user_agent = db.Column(db.Text, nullable=True)
+
+    # Network / location (privacy-conscious, best-effort)
+    ip_address = db.Column(db.String(64), nullable=True)
+    country = db.Column(db.String(80), nullable=True)
+    city = db.Column(db.String(120), nullable=True)
+
+    # State
+    is_current = db.Column(db.Boolean, default=False, nullable=False, index=True)
+    is_active = db.Column(db.Boolean, default=True, nullable=False, index=True)
+
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    last_activity_at = db.Column(db.DateTime, nullable=True, index=True)
+    revoked_at = db.Column(db.DateTime, nullable=True)
+    expires_at = db.Column(db.DateTime, nullable=True, index=True)
+
+
 class RefreshToken(db.Model):
     """A single refresh token (hashed) with one-time use enforcement."""
+
 
     __tablename__ = "refresh_tokens"
 
