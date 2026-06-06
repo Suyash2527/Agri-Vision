@@ -1,6 +1,9 @@
 import base64
 import io
 import json
+import html
+from flask_login import login_user
+from models import User, db
 
 import cv2
 import numpy as np
@@ -9,14 +12,38 @@ import torch
 from PIL import Image
 
 import app
+import security_utils
 
 
 # --- Add Missing Fixtures Here ---
-@pytest.fixture
-def client():
+@pytest.fixture(scope="session")
+def app_with_db():
     app.app.config["TESTING"] = True
+    app.app.config["LOGIN_DISABLED"] = True
     app.app.config["UPLOAD_FOLDER"] = "./static/uploads"
-    with app.app.test_client() as client:
+    app.app.config["SECRET_KEY"] = "test-secret"
+    app.app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024
+    app.app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///:memory:"
+    
+    with app.app.app_context():
+        db.create_all()
+        test_user = User(
+            id=1, 
+            email="test@example.com", 
+            full_name="Test User",
+            password_hash="pbkdf2:sha256:260000$test$test"
+        )
+        db.session.add(test_user)
+        db.session.commit()
+        yield app.app
+        db.drop_all()
+
+@pytest.fixture
+def client(app_with_db):
+    with app_with_db.test_client() as client:
+        with client.session_transaction() as sess:
+            sess['_user_id'] = '1'
+            sess['_fresh'] = True
         yield client
 
 
@@ -45,6 +72,9 @@ class MockResNetModel:
         logits = torch.zeros(1, 8)
         logits[0, 5] = 10.0
         return logits
+
+    def eval(self):
+        return self
 
 
 class MockYOLOBox:
@@ -80,6 +110,8 @@ def test_preprocess_image_for_resnet():
 
 
 def test_infer_disease_fallback(monkeypatch):
+    monkeypatch.setattr(app.model_manager, "resnet_model", None)
+    monkeypatch.setattr(app.model_manager, "loaded", True)
     monkeypatch.setattr(app, "resnet_model", None)
     dummy_img = np.zeros((100, 100, 3), dtype=np.uint8)
     res = app.infer_disease(dummy_img)
@@ -90,6 +122,8 @@ def test_infer_disease_fallback(monkeypatch):
 
 
 def test_infer_disease_active(monkeypatch):
+    monkeypatch.setattr(app.model_manager, "resnet_model", MockResNetModel())
+    monkeypatch.setattr(app.model_manager, "loaded", True)
     monkeypatch.setattr(app, "resnet_model", MockResNetModel())
     dummy_img = np.zeros((100, 100, 3), dtype=np.uint8)
     res = app.infer_disease(dummy_img)
@@ -99,7 +133,8 @@ def test_infer_disease_active(monkeypatch):
 
 
 def test_infer_growth_stage_fallback(monkeypatch):
-    monkeypatch.setattr(app, "yolo_model", None)
+    monkeypatch.setattr(app.model_manager, "yolo_model", None)
+    monkeypatch.setattr(app.model_manager, "loaded", True)
     dummy_img = np.zeros((100, 100, 3), dtype=np.uint8)
     res = app.infer_growth_stage(dummy_img)
     assert res["main_class"] is None
@@ -108,7 +143,8 @@ def test_infer_growth_stage_fallback(monkeypatch):
 
 
 def test_analyze_image_without_growth_detection(monkeypatch):
-    monkeypatch.setattr(app, "yolo_model", None)
+    monkeypatch.setattr(app.model_manager, "yolo_model", None)
+    monkeypatch.setattr(app.model_manager, "loaded", True)
     dummy_img = np.zeros((100, 100, 3), dtype=np.uint8)
     result = app.analyze_image(dummy_img)
     assert "disease" in result
@@ -121,7 +157,8 @@ def test_analyze_image_without_growth_detection(monkeypatch):
 
 
 def test_infer_growth_stage_active(monkeypatch):
-    monkeypatch.setattr(app, "yolo_model", MockYOLOModel())
+    monkeypatch.setattr(app.model_manager, "yolo_model", MockYOLOModel())
+    monkeypatch.setattr(app.model_manager, "loaded", True)
     dummy_img = np.zeros((100, 100, 3), dtype=np.uint8)
     res = app.infer_growth_stage(dummy_img)
     assert res["main_class"] == "Matured Cotton Boll"
@@ -139,6 +176,7 @@ def test_generate_recommendations():
         "confidence": 0.9,
         "all_confidences": {},
         "health_score": 45.0,
+        "is_uncertain": True,
         "raw": [],
     }
     growth_res = {
@@ -151,7 +189,7 @@ def test_generate_recommendations():
     recs = app.generate_recommendations(disease_res, growth_res)
     assert isinstance(recs, list)
     assert len(recs) > 0
-    assert any("Consult an agricultural expert" in r for r in recs)
+    assert any("consult an agricultural expert" in r.lower() for r in recs)
     assert any("insecticides" in r for r in recs or "Aphids" in r)
     assert any("blossom" in r.lower() for r in recs)
 
@@ -171,6 +209,14 @@ def test_home_page_en(client):
     assert b"Agri" in resp.data or b"Vision" in resp.data
 
 
+def test_home_page_hero_demo_cta_links_to_demo(client):
+    resp = client.get("/")
+    assert resp.status_code == 200
+    assert b'id="hero-demo-link"' in resp.data
+    assert b'href="/demo"' in resp.data
+    assert b"View Demo" in resp.data
+
+
 def test_home_page_te(client):
     resp = client.get("/?lang=te")
     assert resp.status_code == 200
@@ -184,8 +230,9 @@ def test_set_language_redirect(client):
 
 
 def test_health_check_endpoint(client, monkeypatch):
-    monkeypatch.setattr(app, "resnet_model", MockResNetModel())
-    monkeypatch.setattr(app, "yolo_model", MockYOLOModel())
+    monkeypatch.setattr(app.model_manager, "resnet_model", MockResNetModel())
+    monkeypatch.setattr(app.model_manager, "yolo_model", MockYOLOModel())
+    monkeypatch.setattr(app.model_manager, "loaded", True)
     resp = client.get("/health")
     assert resp.status_code == 200
     data = json.loads(resp.data)
@@ -194,12 +241,13 @@ def test_health_check_endpoint(client, monkeypatch):
 
 
 def test_health_check_endpoint_fallback(client, monkeypatch):
-    monkeypatch.setattr(app, "resnet_model", None)
-    monkeypatch.setattr(app, "yolo_model", None)
+    monkeypatch.setattr(app.model_manager, "resnet_model", None)
+    monkeypatch.setattr(app.model_manager, "yolo_model", None)
+    monkeypatch.setattr(app.model_manager, "loaded", True)
     resp = client.get("/health")
-    assert resp.status_code == 200
+    assert resp.status_code == 503
     data = json.loads(resp.data)
-    assert data["status"] == "healthy"
+    assert data["status"] == "degraded"
     assert data["model_loaded"] is False
 
 
@@ -328,6 +376,26 @@ def test_post_comparison_invalid_crop_image(client, monkeypatch):
     )
 
 
+def test_post_comparison_duplicate_image(client):
+    # Create the same image twice
+    image_content = io.BytesIO()
+    Image.new("RGB", (100, 100), color="blue").save(image_content, format="PNG")
+    
+    # We need two separate BytesIO objects with the same content for the request
+    image_one = io.BytesIO(image_content.getvalue())
+    image_two = io.BytesIO(image_content.getvalue())
+
+    data = {
+        "last_week_image": (image_one, "field_1.png"),
+        "current_week_image": (image_two, "field_2.png"),
+    }
+    
+    resp = client.post("/comparison", data=data, content_type="multipart/form-data")
+    assert resp.status_code == 200
+    assert b"Duplicate field images detected" in resp.data
+    assert b"Please upload two different images" in resp.data
+
+
 def test_post_comparison_fallback_when_both_images_no_growth(client, monkeypatch):
     def mock_analyze_image(_image):
         return {
@@ -353,7 +421,8 @@ def test_post_comparison_fallback_when_both_images_no_growth(client, monkeypatch
         }
 
     monkeypatch.setattr(app, "analyze_image", mock_analyze_image)
-    monkeypatch.setattr(app, "yolo_model", object())
+    monkeypatch.setattr(app.model_manager, "yolo_model", object())
+    monkeypatch.setattr(app.model_manager, "loaded", True)
 
     image_one = io.BytesIO()
     Image.new("RGB", (80, 80), color="green").save(image_one, format="PNG")
@@ -410,11 +479,13 @@ def test_post_api_analyze_valid(client, valid_image):
     resp = client.post("/api/analyze", data=data, content_type="multipart/form-data")
     assert resp.status_code == 200
     res_data = json.loads(resp.data)
+    assert "weather" in res_data
     assert res_data["status"] == "success"
     assert "results" in res_data
     assert "disease" in res_data["results"]
     assert "growth" in res_data["results"]
     assert "recommendations" in res_data["results"]
+    assert res_data["weather"] is None or isinstance(res_data["weather"],dict)
 
 
 def test_post_api_analyze_missing_file_key(client):
@@ -424,6 +495,94 @@ def test_post_api_analyze_missing_file_key(client):
     assert "error" in res_data
     assert "No file uploaded" in res_data["error"]
 
+def test_yield_estimate_weather_multiplier_changes_with_stress_weather():
+    from services.yield_service import estimate_yield
+
+    disease = {"health_score": 80.0, "predicted_class": "Healthy"}
+    growth = {"main_class": "Matured Cotton Boll"}
+    stress = {"temperature": 40, "humidity": 90, "precipitation": 0}
+
+    y_none = estimate_yield(disease, growth, weather=None)
+    y_stress = estimate_yield(disease, growth, weather=stress)
+
+    assert y_none["weather_multiplier"] == 1.0
+    assert y_stress["weather_multiplier"] < 1.0
+    assert y_none["weather_multiplier"] != y_stress["weather_multiplier"]
+
+def test_post_api_analyze_weather_null_when_resolve_returns_none(client, valid_image, monkeypatch):
+    monkeypatch.setattr(app, "resolve_weather_for_analysis", lambda **kwargs: None)
+    img_bytes = valid_image.getvalue()
+    resp = client.post(
+        "/api/analyze",
+        data={"file": (io.BytesIO(img_bytes), "cotton.png")},
+        content_type="multipart/form-data",
+    )
+    assert resp.status_code == 200
+    body = json.loads(resp.data)
+    assert body.get("weather") is None
+    assert "yield_estimate" in body["results"]
+
+def test_post_api_analyze_invalid_field_acres(client, valid_image):
+    img_bytes = valid_image.getvalue()
+    resp = client.post(
+        "/api/analyze",
+        data={
+            "file": (io.BytesIO(img_bytes), "cotton.png"),
+            "field_acres": "not-a-number",
+        },
+        content_type="multipart/form-data",
+    )
+    assert resp.status_code == 400
+    assert "field_acres" in json.loads(resp.data)["error"].lower()
+
+def test_post_api_analyze_recommendations_unique_with_weather(client, valid_image, monkeypatch):
+    monkeypatch.setattr(
+        app,
+        "resolve_weather_for_analysis",
+        lambda **kwargs: {"temperature": 40, "humidity": 90, "precipitation": 0},
+    )
+    img_bytes = valid_image.getvalue()
+    resp = client.post(
+        "/api/analyze",
+        data={"file": (io.BytesIO(img_bytes), "cotton.png"), "lat": "30.0", "lon": "31.0"},
+        content_type="multipart/form-data",
+    )
+    assert resp.status_code == 200
+    recs = json.loads(resp.data)["results"]["recommendations"]
+    assert len(recs) == len(set(recs))
+
+def test_analyze_web_and_api_yield_multiplier_consistent(client, valid_image, monkeypatch):
+    stress = {"temperature": 40, "humidity": 90, "precipitation": 0}
+    monkeypatch.setattr(app, "resolve_weather_for_analysis", lambda **kwargs: stress)
+    img_bytes = valid_image.getvalue()
+    file_field = (io.BytesIO(img_bytes), "cotton.png")
+    form = {"file": file_field, "lat": "29.5", "lon": "30.8"}
+
+    api_resp = client.post(
+    "/api/analyze",
+    data={"file": (io.BytesIO(img_bytes), "cotton.png"), "lat": "29.5", "lon": "30.8"},
+    content_type="multipart/form-data",
+    )
+    assert api_resp.status_code == 200
+    api_yield = json.loads(api_resp.data)["results"]["yield_estimate"]
+
+    web_resp = client.post(
+    "/analyze",
+    data={"file": (io.BytesIO(img_bytes), "cotton.png"), "lat": "29.5", "lon": "30.8"},
+    content_type="multipart/form-data",
+    )
+    assert web_resp.status_code == 200
+    text = html.unescape(web_resp.get_data(as_text=True))
+    start = text.find('<pre class="results-pre">')
+    assert start != -1
+    start += len('<pre class="results-pre">')
+    end = text.find("</pre>", start)
+    blob = text[start:end].strip()
+    web_payload = json.loads(blob)
+    web_yield = web_payload["yield_estimate"]
+
+    assert api_yield["weather_multiplier"] == web_yield["weather_multiplier"]
+    assert api_yield["combined_multiplier"] == web_yield["combined_multiplier"]
 
 def test_post_api_analyze_empty_filename(client):
     data = {"file": (io.BytesIO(b""), "")}
@@ -440,7 +599,71 @@ def test_post_api_analyze_invalid_image(client, invalid_file):
     assert resp.status_code == 400
     res_data = json.loads(resp.data)
     assert "error" in res_data
-    assert "Invalid image file" in res_data["error"]
+    assert "Invalid image" in res_data["error"]
+
+
+def test_post_api_analyze_rejects_mime_mismatch(client, valid_image, monkeypatch):
+    monkeypatch.setattr(security_utils, "detect_mime_type", lambda _data: "text/plain")
+    img_bytes = valid_image.getvalue()
+    data = {"file": (io.BytesIO(img_bytes), "test_cotton.png")}
+    resp = client.post("/api/analyze", data=data, content_type="multipart/form-data")
+    assert resp.status_code == 400
+    res_data = json.loads(resp.data)
+    assert "error" in res_data
+    assert "Invalid image content" in res_data["error"]
+
+
+def test_post_api_analyze_oversized_file(client, oversized_file):
+    data = {"file": (oversized_file, "large_cotton.png")}
+    resp = client.post("/api/analyze", data=data, content_type="multipart/form-data")
+    assert resp.status_code == 413
+
+
+def test_api_analyze_rate_limit(client, valid_image):
+    img_bytes = valid_image.getvalue()
+    original_limit = app.app.config.get("API_UPLOAD_RATE_LIMIT")
+    app.app.config["API_UPLOAD_RATE_LIMIT"] = "1 per minute"
+    try:
+        resp_one = client.post(
+            "/api/analyze",
+            data={"file": (io.BytesIO(img_bytes), "rate_limit.png")},
+            content_type="multipart/form-data",
+            environ_base={"REMOTE_ADDR": "10.0.0.55"},
+        )
+        assert resp_one.status_code == 200
+
+        resp_two = client.post(
+            "/api/analyze",
+            data={"file": (io.BytesIO(img_bytes), "rate_limit.png")},
+            content_type="multipart/form-data",
+            environ_base={"REMOTE_ADDR": "10.0.0.55"},
+        )
+        assert resp_two.status_code == 429
+    finally:
+        app.app.config["API_UPLOAD_RATE_LIMIT"] = original_limit
+
+
+def test_api_analyze_cleans_temp_upload(client, valid_image, tmp_path):
+    app.app.config["UPLOAD_TMP_DIR"] = str(tmp_path)
+    img_bytes = valid_image.getvalue()
+    resp = client.post(
+        "/api/analyze",
+        data={"file": (io.BytesIO(img_bytes), "cleanup.png")},
+        content_type="multipart/form-data",
+    )
+    assert resp.status_code == 200
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_resolve_secret_key_requires_production_secret():
+    with pytest.raises(RuntimeError):
+        security_utils.resolve_secret_key({"FLASK_ENV": "production"})
+
+
+def test_sanitize_filename_strips_unicode_and_limits():
+    cleaned = security_utils.sanitize_filename("t\u00e9st\u2603_long_name.png")
+    assert cleaned.endswith(".png")
+    assert cleaned.isascii()
 
 
 def test_datetimeformat_filter():
@@ -534,4 +757,75 @@ def test_gradcam_class_initialization():
     res = gradcam(input_tensor, target_class_idx=2, original_image_rgb=orig_img)
     assert res is not None
     assert res.shape == (224, 224, 3)
+
+
+def test_api_chat_test(client):
+    resp = client.get("/api/chat_test")
+    assert resp.status_code == 200
+    data = json.loads(resp.data)
+    assert data == {"status": "ok"}
+
+
+def test_api_chat_empty_message(client):
+    resp = client.post("/api/chat", json={})
+    assert resp.status_code == 400
+    data = json.loads(resp.data)
+    assert "reply" in data
+    assert "didn't receive a message" in data["reply"]
+
+
+def test_api_chat_keyword_matching(client):
+    # Test "hello"
+    resp = client.post("/api/chat", json={"message": "Hello!"})
+    assert resp.status_code == 200
+    data = json.loads(resp.data)
+    assert "Hello there!" in data["reply"] or "Hi!" in data["reply"]
+
+    # Test "disease"
+    resp = client.post("/api/chat", json={"message": "Spots on crop leaves"})
+    assert resp.status_code == 200
+    data = json.loads(resp.data)
+    assert "Bacterial Blight" in data["reply"] or "Target Spot" in data["reply"]
+
+    # Test "yield"
+    resp = client.post("/api/chat", json={"message": "how to improve yield"})
+    assert resp.status_code == 200
+    data = json.loads(resp.data)
+    assert "health score" in data["reply"] or "growth stage" in data["reply"]
+
+
+def test_api_chat_fallback_response(client):
+    resp = client.post("/api/chat", json={"message": "unknown query message"})
+    assert resp.status_code == 200
+    data = json.loads(resp.data)
+    assert "Agri-Vision AI assistant" in data["reply"]
+
+
+def test_api_batch_status_stream_not_found(client):
+    resp = client.get("/api/batch_status/nonexistent-job-id/stream")
+    assert resp.status_code == 404
+
+
+def test_api_batch_status_stream_valid(client):
+    from models import BatchJob, db
+    with app.app.app_context():
+        job = BatchJob(id="test-sse-job", total_images=1, status="pending")
+        db.session.add(job)
+        db.session.commit()
+    
+    resp = client.get("/api/batch_status/test-sse-job/stream")
+    assert resp.status_code == 200
+    assert resp.mimetype == "text/event-stream"
+    
+    # Verify we can read the streamed chunks
+    data_chunks = []
+    for chunk in resp.response:
+        data_chunks.append(chunk.decode("utf-8"))
+        break
+        
+    assert len(data_chunks) > 0
+    assert "data:" in data_chunks[0]
+    payload = json.loads(data_chunks[0].replace("data:", "").strip())
+    assert payload["job"]["id"] == "test-sse-job"
+
 
