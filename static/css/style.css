@@ -2899,24 +2899,75 @@ nav a[href="/model-admin"]:hover {
         color: var(--footer-text);
         margin: 0;
     }
+/*
+   FOOTER NAVIGATION LINK SYSTEM
 
+   This footer hyperlink group serves as the primary
+   secondary-navigation area for users seeking access
+   to informational resources, support channels,
+   educational content, and platform-related pages.
+
+   Design Objectives:
+   - Maintain visual consistency with the global
+     Agri-Vision design language.
+   - Provide predictable navigation behavior across
+     all viewport sizes and device categories.
+   - Ensure typography hierarchy remains aligned
+     with established UI standards.
+   - Preserve accessibility and readability while
+     supporting dark-mode environments.
+
+   Enhancements Included:
+   - Consistent spacing between navigation items.
+   - Unified typography and font-weight handling.
+   - Smooth hover-state transitions.
+   - Responsive wrapping for smaller screens.
+   - Theme-aware color inheritance through CSS variables.
+   - Improved long-term maintainability through
+     centralized footer link styling.
+
+   Future Extension Possibilities:
+   - Animated underline indicators.
+   - Active-page highlighting.
+   - Keyboard navigation enhancements.
+   - Focus-visible accessibility improvements.
+   - Icon-supported footer navigation groups.
+ */
     .footer-links-compact {
         display: flex;
         gap: 2rem;
     }
 
     .footer-links-compact a {
-        color: var(--footer-text);
-        text-decoration: none;
-        font-size: 0.9rem;
-        opacity: 0.95;
-        transition: var(--transition-smooth);
-        font-weight: 600;
+    color: var(--footer-text);
+    text-decoration: none;
+    font-size: 0.9rem;
+    opacity: 0.95;
+    transition: var(--transition-smooth);
+    font-weight: 600;
+    letter-spacing: 0.3px;
+    position: relative;
     }
 
     .footer-links-compact a:hover {
         opacity: 1;
-        text-decoration: underline;
+        color: var(--emerald-green);
+        text-decoration: none;
+    }
+
+    .footer-links-compact a::after {
+        content: "";
+        position: absolute;
+        left: 0;
+        bottom: -4px;
+        width: 0;
+        height: 2px;
+        background: var(--emerald-green);
+        transition: width 0.3s ease;
+    }
+
+    .footer-links-compact a:hover::after {
+        width: 100%;
     }
 
     .footer-bottom {
