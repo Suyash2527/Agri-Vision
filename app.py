@@ -19,6 +19,7 @@ from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from io import BytesIO
 from services.weather_service import get_weather
+from sqlalchemy import inspect, text
 
 import redis
 import base64
@@ -49,6 +50,11 @@ from jinja2 import Environment, FileSystemLoader
 from model_registry import registry
 from services.weather_service import generate_weather_recommendations
 from services.yield_service import estimate_yield
+from services.auth_security_service import (
+    AccountLockoutService,
+    get_client_ip,
+    get_user_agent,
+)
 from security_utils import (
     UploadValidationError,
     cleanup_temp_upload,
@@ -97,6 +103,55 @@ limiter = Limiter(
 )
 from models import db
 db.init_app(app)
+
+
+_account_lockout_schema_checked = False
+
+
+def ensure_account_lockout_schema() -> None:
+    """Backfill account lockout columns for existing create_all-managed DBs."""
+    inspector = inspect(db.engine)
+    if "users" not in inspector.get_table_names():
+        return
+
+    existing_columns = {column["name"] for column in inspector.get_columns("users")}
+    dialect = db.engine.dialect.name
+    datetime_type = "TIMESTAMP" if dialect == "postgresql" else "DATETIME"
+    columns = {
+        "failed_login_attempts": "INTEGER NOT NULL DEFAULT 0",
+        "last_failed_login_at": datetime_type,
+        "account_locked_until": datetime_type,
+        "last_successful_login_at": datetime_type,
+        "last_failed_ip": "VARCHAR(64)",
+        "last_successful_ip": "VARCHAR(64)",
+    }
+
+    changed = False
+    with db.engine.begin() as connection:
+        for column_name, ddl_type in columns.items():
+            if column_name not in existing_columns:
+                connection.execute(text(f"ALTER TABLE users ADD COLUMN {column_name} {ddl_type}"))
+                changed = True
+        connection.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_users_account_locked_until "
+                "ON users (account_locked_until)"
+            )
+        )
+    if changed:
+        logger.info("Account lockout schema columns added to users table")
+
+
+@app.before_request
+def _ensure_account_lockout_schema_once() -> None:
+    global _account_lockout_schema_checked
+    if _account_lockout_schema_checked or app.config.get("TESTING"):
+        return
+    try:
+        ensure_account_lockout_schema()
+        _account_lockout_schema_checked = True
+    except Exception as exc:
+        logger.warning("Account lockout schema check skipped: %s", exc)
 
 # --- Login Manager Configuration ---
 login_manager = LoginManager()
@@ -2742,25 +2797,56 @@ def login():
         return redirect(url_for('index'))
     
     if request.method == 'POST':
-        email = request.form.get('email')
-        password = request.form.get('password')
+        email = (request.form.get('email') or '').strip().lower()
+        password = request.form.get('password') or ''
         remember = request.form.get('remember')
+        ip_address = get_client_ip()
+        user_agent = get_user_agent()
+        lockout_service = AccountLockoutService()
         
         from models import User
         user = User.query.filter_by(email=email).first()
+
+        if user:
+            lockout_state = lockout_service.check_lockout(user)
+            if lockout_state.unlocked_expired_lock:
+                lockout_service.record_unlock(
+                    user,
+                    ip=ip_address,
+                    user_agent=user_agent,
+                )
+                db.session.commit()
+            if lockout_state.locked:
+                flash('Account temporarily locked. Please try again later.', 'danger')
+                return render_template(
+                    'login.html',
+                    google_oauth_enabled=GOOGLE_OAUTH_ENABLED,
+                ), 423
         
         if user and user.check_password(password):
             if not user.is_active:
                 flash('Your account has been deactivated. Please contact support.', 'danger')
-                return render_template('login.html')
+                return render_template('login.html', google_oauth_enabled=GOOGLE_OAUTH_ENABLED)
             
             login_user(user, remember=remember)
-            user.last_login = datetime.utcnow()
+            lockout_service.record_successful_login(
+                user,
+                ip=ip_address,
+                user_agent=user_agent,
+            )
+            user.last_login = user.last_successful_login_at
             db.session.commit()
             
             next_page = request.args.get('next')
             return redirect(next_page) if next_page else redirect(url_for('index'))
         else:
+            if user:
+                lockout_service.record_failed_login(
+                    user,
+                    ip=ip_address,
+                    user_agent=user_agent,
+                )
+                db.session.commit()
             flash('Invalid email or password', 'danger')
     
     return render_template('login.html', google_oauth_enabled=GOOGLE_OAUTH_ENABLED)
@@ -3596,6 +3682,7 @@ if __name__ == '__main__':
     # Initialize database tables
     with app.app_context():
         db.create_all()
+        ensure_account_lockout_schema()
         logger.info("Database tables created")
 
         # Seed enterprise RBAC (idempotent)
