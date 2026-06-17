@@ -262,7 +262,7 @@ csp = {
     ],
     'connect-src': ["'self'"]
 }
-Talisman(app, content_security_policy=csp, force_https=False)
+Talisman(app, content_security_policy=csp, force_https=False, session_cookie_secure=False)
 
 
 app.config["TEMPLATES_AUTO_RELOAD"] = True
